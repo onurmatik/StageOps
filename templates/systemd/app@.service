@@ -1,0 +1,47 @@
+# /etc/systemd/system/app@.service (for cold tier)
+
+[Unit]
+Description=Gunicorn (cold) for %i
+After=network.target
+Requires=app@%i.socket
+
+[Service]
+User=ubuntu
+Group=www-data
+WorkingDirectory=/srv/apps/%i
+Environment=PATH=/srv/apps/%i/venv/bin
+
+RuntimeDirectory=%i
+RuntimeDirectoryMode=0775
+
+ExecStart=/srv/apps/%i/venv/bin/gunicorn %i.wsgi:application \
+  --worker-class gthread \
+  --workers 1 \
+  --threads 2 \
+  --timeout 60 \
+  --graceful-timeout 30 \
+  --max-requests 500 \
+  --max-requests-jitter 50 \
+  --bind unix:/run/%i/gunicorn.sock \
+  --umask 007 \
+  --user ubuntu \
+  --group www-data \
+  --access-logfile - \
+  --error-logfile /srv/apps/%i/logs/gunicorn-error.log
+
+# Important difference vs hot tier
+Restart=on-failure
+RestartSec=5
+
+# Cold-tier resource limits
+MemoryMax=300M
+CPUQuota=40%
+
+KillSignal=SIGTERM
+TimeoutStopSec=35
+LimitNOFILE=4096
+
+Slice=staging.slice
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# /etc/systemd/system/app@.socket
+
+[Unit]
+Description=Gunicorn socket for %i
+
+[Socket]
+ListenStream=/run/%i/gunicorn.sock
+SocketUser=ubuntu
+SocketGroup=www-data
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
