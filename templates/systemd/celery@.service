@@ -1,0 +1,51 @@
+[Unit]
+Description=Celery worker for %i
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=www-data
+
+WorkingDirectory=/srv/apps/%i
+
+# Proje env'i (varsa)
+
+EnvironmentFile=-/srv/apps/%i/.env
+
+# Varsayılanlar (projede override edilebilir)
+
+Environment=CELERY_CONCURRENCY=1
+Environment=CELERY_LOGLEVEL=INFO
+Environment=CELERY_QUEUE=%i
+
+# Django varsayımı (WSGI server zaten gunicorn)
+
+ExecStart=/srv/apps/%i/.venv/bin/celery \
+  -A %i worker \
+  -Q ${CELERY_QUEUE} \
+  --concurrency=${CELERY_CONCURRENCY} \
+  --loglevel=${CELERY_LOGLEVEL}
+
+Restart=always
+RestartSec=5
+
+# Kaynak limitleri (staging-friendly)
+
+MemoryMax=300M
+CPUQuota=40%
+
+# Güvenlik / hijyen
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+
+StandardOutput=journal
+StandardError=journal
+
+Slice=staging.slice
+
+[Install]
+WantedBy=multi-user.target

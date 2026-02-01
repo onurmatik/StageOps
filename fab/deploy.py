@@ -1,118 +1,203 @@
+from __future__ import annotations
+
+import os
 from pathlib import Path
 from fabric import Connection, task
-import os
+from invoke import Collection
+from dotenv import load_dotenv
 
-STAGEOPS_ROOT = Path(__file__).resolve().parent.parent
-TEMPLATES = STAGEOPS_ROOT / "templates"
+# --------------------------------------------------
+# ENV & GLOBALS
+# --------------------------------------------------
 
-DEFAULT_HOST = os.environ.get("STAGE_HOST")
-DEFAULT_USER = os.environ.get("STAGE_USER", "ubuntu")
-DEFAULT_KEY = os.environ.get("STAGE_KEY", "~/.ssh/stage-ec2-key.pem")
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BASE_DIR / "project.env"
+
+load_dotenv(ENV_FILE)
+
+PROJECT_NAME = os.environ["PROJECT_NAME"]
+DOMAIN = os.environ["DOMAIN"]
+
+REPO_URL = os.environ["REPO_URL"]
+BRANCH = os.environ.get("BRANCH", "main")
+
+HOST = os.environ["HOST"]
+USER = os.environ.get("USER", "ubuntu")
+SSH_KEY = os.environ["SSH_KEY"]
+
+TIER = os.environ.get("TIER", "cold")  # hot | cold
+
+ENABLE_NODE = os.environ.get("ENABLE_NODE", "0") in {"1", "true", "yes"}
+NODE_PORT = os.environ.get("NODE_PORT", "3000")
+
+BACKEND_PATHS = os.environ.get("BACKEND_PATHS", "")
+
+# --------------------------------------------------
+# PATHS (SERVER)
+# --------------------------------------------------
+
+PROJECT_DIR = f"/srv/apps/{PROJECT_NAME}"
+VENV_DIR = f"{PROJECT_DIR}/venv"
+
+LOG_DIR = f"/var/log/{PROJECT_NAME}"
+RUN_DIR = f"/run/{PROJECT_NAME}"
+
+GUNICORN_SOCKET = f"{RUN_DIR}/gunicorn.sock"
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
 
 
-def debug(msg: str):
+def debug(msg: str) -> None:
     print(f"[stageops] {msg}")
 
 
-def load_project_env():
-    env_path = Path(".deploy/project.env")
-    if not env_path.exists():
-        raise RuntimeError("Missing .deploy/project.env")
-
-    env = {}
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        k, v = line.split("=", 1)
-        env[k.strip()] = v.strip()
-    return env
+def parse_backend_paths(raw: str) -> list[str]:
+    if not raw:
+        return []
+    return [p.strip().rstrip("/") for p in raw.split(",") if p.strip()]
 
 
-def install_shared_systemd_templates(c):
-    debug("Ensuring shared systemd templates")
+def render_template(text: str, ctx: dict) -> str:
+    for k, v in ctx.items():
+        text = text.replace(f"{{{k}}}", str(v))
+    return text
 
-    for name in ["app@.service", "app@.socket", "celery@.service", "node@.service"]:
-        src = TEMPLATES / "systemd" / name
-        if not src.exists():
-            continue
-        tmp = f"/tmp/{name}"
-        c.put(src.as_posix(), tmp)
-        c.sudo(f"mv {tmp} /etc/systemd/system/{name}")
+
+def upload_template(c, local_path: Path, remote_path: str, context: dict):
+    rendered = render_template(local_path.read_text(), context)
+    tmp = f"/tmp/{local_path.name}"
+    c.put(Path(local_path).write_text(rendered) or local_path, tmp)
+    c.sudo(f"mv {tmp} {remote_path}")
+
+
+# --------------------------------------------------
+# NGINX CONTEXT
+# --------------------------------------------------
+
+backend_locations = []
+for path in parse_backend_paths(BACKEND_PATHS):
+    backend_locations.append(f"""
+    location ^~ {path}/ {{
+        proxy_pass http://unix:{GUNICORN_SOCKET}:;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }}
+    """)
+
+BACKEND_LOCATIONS = "\n".join(backend_locations)
+
+if ENABLE_NODE:
+    FRONTEND_UPSTREAM = f"http://127.0.0.1:{NODE_PORT}"
+else:
+    FRONTEND_UPSTREAM = f"http://unix:{GUNICORN_SOCKET}:"
+
+TEMPLATE_CONTEXT = {
+    "PROJECT_NAME": PROJECT_NAME,
+    "DOMAIN": DOMAIN,
+    "PROJECT_DIR": PROJECT_DIR,
+    "GUNICORN_SOCKET": GUNICORN_SOCKET,
+    "BACKEND_LOCATIONS": BACKEND_LOCATIONS,
+    "FRONTEND_UPSTREAM": FRONTEND_UPSTREAM,
+}
+
+# --------------------------------------------------
+# DEPLOY TASK
+# --------------------------------------------------
 
 
 @task
 def deploy(c):
     """
-    StageOps deploy:
-    - applies systemd lifecycle
-    - manages hot/cold tier
-    - enables optional services (node, celery)
+    Deploy a project using StageOps.
     """
-
-    env = load_project_env()
-
-    project = env["PROJECT_NAME"]
-    tier = env.get("TIER", "cold")
-
-    enable_node = env.get("ENABLE_NODE", "0") == "1"
-    node_port = env.get("NODE_PORT")
-
-    enable_celery = env.get("ENABLE_CELERY", "0") == "1"
-    celery_queue = env.get("CELERY_QUEUE", project)
-
-    debug(f"Deploying {project}")
-    debug(f"tier={tier} node={enable_node} celery={enable_celery}")
+    debug(f"Deploying {PROJECT_NAME} ({TIER})")
 
     c = Connection(
-        host=DEFAULT_HOST,
-        user=DEFAULT_USER,
-        connect_kwargs={"key_filename": os.path.expanduser(DEFAULT_KEY)},
+        host=HOST,
+        user=USER,
+        connect_kwargs={"key_filename": SSH_KEY},
     )
 
-    install_shared_systemd_templates(c)
+    # Directories
+    c.sudo(f"mkdir -p {PROJECT_DIR} {LOG_DIR} {RUN_DIR}")
+    c.sudo(f"chown -R {USER}:{USER} {PROJECT_DIR} {LOG_DIR}")
 
-    # --- GUNICORN (core service) ---
-    debug("Configuring gunicorn")
-
-    if tier == "hot":
-        c.sudo(f"systemctl disable app@{project}.socket", warn=True)
-        c.sudo(f"systemctl enable app@{project}.service --now")
-    elif tier == "cold":
-        c.sudo(f"systemctl disable app@{project}.service", warn=True)
-        c.sudo(f"systemctl enable app@{project}.socket")
+    # Clone / update repo
+    if c.run(f"test -d {PROJECT_DIR}/.git", warn=True).failed:
+        debug("Cloning repository")
+        c.run(f"git clone -b {BRANCH} {REPO_URL} {PROJECT_DIR}")
     else:
-        debug("Dormant tier: disabling gunicorn")
-        c.sudo(f"systemctl disable app@{project}.service", warn=True)
-        c.sudo(f"systemctl disable app@{project}.socket", warn=True)
+        debug("Updating repository")
+        with c.cd(PROJECT_DIR):
+            c.run("git fetch")
+            c.run(f"git reset --hard origin/{BRANCH}")
 
-    # --- NODE ---
-    debug("Configuring node")
+    # Virtualenv
+    if c.run(f"test -d {VENV_DIR}", warn=True).failed:
+        debug("Creating virtualenv")
+        c.run(f"python3 -m venv {VENV_DIR}")
 
-    if enable_node:
-        c.sudo(
-            f"systemctl enable node@{project}.service --now"
-        )
-    else:
-        c.sudo(
-            f"systemctl disable node@{project}.service",
-            warn=True
-        )
+    with c.cd(PROJECT_DIR):
+        debug("Installing Python dependencies")
+        c.run(f"{VENV_DIR}/bin/pip install -U pip")
+        c.run(f"{VENV_DIR}/bin/pip install -r requirements.txt", warn=True)
 
-    # --- CELERY ---
-    debug("Configuring celery")
+    # --------------------------------------------------
+    # systemd units
+    # --------------------------------------------------
 
-    if enable_celery:
-        c.sudo(
-            f"systemctl enable celery@{project}.service --now"
-        )
-    else:
-        c.sudo(
-            f"systemctl disable celery@{project}.service",
-            warn=True
-        )
+    debug("Installing systemd templates")
 
-    debug("Reloading systemd")
+    c.put("systemd/app@.service", "/tmp/app@.service")
+    c.put("systemd/app@.socket", "/tmp/app@.socket")
+    c.put("systemd/node@.service", "/tmp/node@.service")
+    c.put("systemd/celery@.service", "/tmp/celery@.service")
+
+    c.sudo("mv /tmp/app@.service /etc/systemd/system/")
+    c.sudo("mv /tmp/app@.socket /etc/systemd/system/")
+    c.sudo("mv /tmp/node@.service /etc/systemd/system/")
+    c.sudo("mv /tmp/celery@.service /etc/systemd/system/")
+
+    # --------------------------------------------------
+    # nginx
+    # --------------------------------------------------
+
+    debug("Configuring nginx")
+
+    upload_template(
+        c,
+        BASE_DIR / "templates/nginx/django.conf.j2",
+        f"/etc/nginx/sites-available/{PROJECT_NAME}.conf",
+        TEMPLATE_CONTEXT,
+    )
+
+    c.sudo(
+        f"ln -sf /etc/nginx/sites-available/{PROJECT_NAME}.conf "
+        f"/etc/nginx/sites-enabled/{PROJECT_NAME}.conf"
+    )
+
+    # --------------------------------------------------
+    # Enable services
+    # --------------------------------------------------
+
     c.sudo("systemctl daemon-reload")
 
-    debug("StageOps deploy complete")
+    if TIER == "hot":
+        c.sudo(f"systemctl enable --now app@{PROJECT_NAME}")
+    else:
+        c.sudo(f"systemctl enable --now app@{PROJECT_NAME}.socket")
+
+    if ENABLE_NODE:
+        c.sudo(f"systemctl enable --now node@{PROJECT_NAME}")
+
+    c.sudo("nginx -t")
+    c.sudo("systemctl reload nginx")
+
+    debug("Deploy completed successfully")
+
+
+ns = Collection(deploy)
