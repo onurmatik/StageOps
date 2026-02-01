@@ -8,6 +8,7 @@ ListenStream=/run/%i/gunicorn.sock
 SocketUser=ubuntu
 SocketGroup=www-data
 SocketMode=0660
+DirectoryMode=0775
 
 [Install]
 WantedBy=sockets.target

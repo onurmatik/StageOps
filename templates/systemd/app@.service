@@ -27,7 +27,10 @@ ExecStart=/srv/apps/%i/venv/bin/gunicorn %i.wsgi:application \
   --user ubuntu \
   --group www-data \
   --access-logfile - \
-  --error-logfile /srv/apps/%i/logs/gunicorn-error.log
+  --error-logfile /var/log/%i/gunicorn-error.log
+
+ExecStartPost=/bin/chgrp www-data /run/%i/gunicorn.sock
+ExecStartPost=/bin/chmod 660 /run/%i/gunicorn.sock
 
 # Important difference vs hot tier
 Restart=on-failure
