@@ -246,25 +246,6 @@ def deploy(c, project):
     c.sudo(f"chmod 2775 {RUN_DIR}")
 
     # --------------------------------------------------
-    # PROJECT ENV
-    # --------------------------------------------------
-
-    debug("Uploading project .env")
-    env_text = normalize_env_text(env_path.read_text(), PROJECT_DIR)
-    with tempfile.NamedTemporaryFile("w", delete=False) as tmp_env:
-        tmp_env.write(env_text)
-        tmp_env_path = tmp_env.name
-
-    remote_env_tmp = f"/tmp/{PROJECT_NAME}.env"
-    try:
-        c.put(tmp_env_path, remote_env_tmp)
-        c.sudo(f"mv {remote_env_tmp} {PROJECT_DIR}/.env")
-        c.sudo(f"chown {USER}:{USER} {PROJECT_DIR}/.env")
-        c.sudo(f"chmod 600 {PROJECT_DIR}/.env")
-    finally:
-        os.remove(tmp_env_path)
-
-    # --------------------------------------------------
     # CLONE / UPDATE REPO
     # --------------------------------------------------
 
@@ -283,6 +264,25 @@ def deploy(c, project):
         with c.cd(PROJECT_DIR):
             c.run("git fetch")
             c.run(f"git reset --hard origin/{BRANCH}")
+
+    # --------------------------------------------------
+    # PROJECT ENV
+    # --------------------------------------------------
+
+    debug("Uploading project .env")
+    env_text = normalize_env_text(env_path.read_text(), PROJECT_DIR)
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp_env:
+        tmp_env.write(env_text)
+        tmp_env_path = tmp_env.name
+
+    remote_env_tmp = f"/tmp/{PROJECT_NAME}.env"
+    try:
+        c.put(tmp_env_path, remote_env_tmp)
+        c.sudo(f"mv {remote_env_tmp} {PROJECT_DIR}/.env")
+        c.sudo(f"chown {USER}:{USER} {PROJECT_DIR}/.env")
+        c.sudo(f"chmod 600 {PROJECT_DIR}/.env")
+    finally:
+        os.remove(tmp_env_path)
 
     # --------------------------------------------------
     # PYTHON ENV
