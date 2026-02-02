@@ -104,6 +104,38 @@ def upload_template(c: Connection, src: Path, dst: str, ctx: dict) -> None:
     finally:
         os.remove(tmp_path)
 
+def resolve_node_dir(raw: str | None, project_dir: str) -> str:
+    if not raw:
+        return project_dir
+    raw = raw.strip()
+    if raw.startswith(("'", '"')) and raw.endswith(raw[0]) and len(raw) >= 2:
+        raw = raw[1:-1]
+    if raw.startswith("/"):
+        return raw
+    return f"{project_dir}/{raw}"
+
+def normalize_env_text(env_text: str, project_dir: str) -> str:
+    lines = env_text.splitlines()
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            out.append(line)
+            continue
+        key, sep, value = line.partition("=")
+        if key.strip() != "NODE_DIR" or not sep:
+            out.append(line)
+            continue
+        raw = value.strip()
+        quote = ""
+        if raw.startswith(("'", '"')) and raw.endswith(raw[0]) and len(raw) >= 2:
+            quote = raw[0]
+            raw = raw[1:-1]
+        resolved = resolve_node_dir(raw, project_dir)
+        new_val = f"{quote}{resolved}{quote}" if quote else resolved
+        out.append(f"{key}{sep}{new_val}")
+    return "\n".join(out) + ("\n" if env_text.endswith("\n") else "")
+
 
 # ==================================================
 # DEPLOY TASK
@@ -175,18 +207,28 @@ def deploy(c, project):
     # --------------------------------------------------
 
     c.sudo(f"mkdir -p {PROJECT_DIR} {LOG_DIR} {RUN_DIR}")
-    c.sudo(f"chown -R {USER}:{USER} {PROJECT_DIR} {LOG_DIR} {RUN_DIR}")
+    c.sudo(f"chown -R {USER}:{USER} {PROJECT_DIR} {LOG_DIR}")
+    c.sudo(f"chown {USER}:www-data {RUN_DIR}")
+    c.sudo(f"chmod 2775 {RUN_DIR}")
 
     # --------------------------------------------------
     # PROJECT ENV
     # --------------------------------------------------
 
     debug("Uploading project .env")
+    env_text = normalize_env_text(env_path.read_text(), PROJECT_DIR)
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp_env:
+        tmp_env.write(env_text)
+        tmp_env_path = tmp_env.name
+
     remote_env_tmp = f"/tmp/{PROJECT_NAME}.env"
-    c.put(env_path, remote_env_tmp)
-    c.sudo(f"mv {remote_env_tmp} {PROJECT_DIR}/.env")
-    c.sudo(f"chown {USER}:{USER} {PROJECT_DIR}/.env")
-    c.sudo(f"chmod 600 {PROJECT_DIR}/.env")
+    try:
+        c.put(tmp_env_path, remote_env_tmp)
+        c.sudo(f"mv {remote_env_tmp} {PROJECT_DIR}/.env")
+        c.sudo(f"chown {USER}:{USER} {PROJECT_DIR}/.env")
+        c.sudo(f"chmod 600 {PROJECT_DIR}/.env")
+    finally:
+        os.remove(tmp_env_path)
 
     # --------------------------------------------------
     # CLONE / UPDATE REPO
@@ -220,6 +262,29 @@ def deploy(c, project):
         debug("Installing Python dependencies")
         c.run(f"{VENV_DIR}/bin/pip install -U pip")
         c.run(f"{VENV_DIR}/bin/pip install -r requirements.txt", warn=True)
+
+    # --------------------------------------------------
+    # NODE / FRONTEND
+    # --------------------------------------------------
+
+    if ENABLE_NODE:
+        node_dir = resolve_node_dir(env.get("NODE_DIR"), PROJECT_DIR)
+        debug("Preparing frontend")
+
+        if c.run(f"test -f {node_dir}/package.json", warn=True).failed:
+            raise RuntimeError(
+                f"package.json not found at {node_dir}. "
+                f"Set NODE_DIR in {env_path}."
+            )
+
+        node_install_cmd = env.get("NODE_INSTALL_CMD") or "npm install"
+        node_build_cmd = env.get("NODE_BUILD_CMD") or "npm run build --if-present"
+
+        with c.cd(node_dir):
+            debug("Installing Node dependencies")
+            c.run(node_install_cmd)
+            debug("Building frontend")
+            c.run(node_build_cmd)
 
     # --------------------------------------------------
     # SYSTEMD UNITS
@@ -293,6 +358,19 @@ def deploy(c, project):
 
     c.sudo("nginx -t")
     c.sudo("systemctl reload nginx")
+
+    debug("Restarting services")
+    if TIER == "hot":
+        c.sudo(f"systemctl restart app@{PROJECT_NAME}")
+    else:
+        c.sudo(f"systemctl restart app@{PROJECT_NAME}.socket")
+        c.sudo(f"systemctl try-restart app@{PROJECT_NAME}.service")
+
+    if ENABLE_NODE:
+        c.sudo(f"systemctl restart node@{PROJECT_NAME}")
+
+    if ENABLE_CELERY:
+        c.sudo(f"systemctl restart celery@{PROJECT_NAME}")
 
     debug("Deploy completed successfully")
 

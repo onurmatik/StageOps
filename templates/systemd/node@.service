@@ -10,13 +10,13 @@ Group=www-data
 WorkingDirectory=/srv/apps/%i
 
 Environment=NODE_ENV=production
-Environment=PORT=%E{NODE_PORT}
+Environment=NODE_DIR=/srv/apps/%i
 
 # Optional per-project env file
 
 EnvironmentFile=-/srv/apps/%i/.env
 
-ExecStart=/usr/bin/npm start
+ExecStart=/bin/sh -lc 'cd "${NODE_DIR:-/srv/apps/%i}" && export PORT="${NODE_PORT:-3000}" && exec /bin/sh -lc "${NODE_START_CMD:-/usr/bin/npm start}"'
 
 Restart=always
 RestartSec=5

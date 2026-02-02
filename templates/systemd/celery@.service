@@ -21,7 +21,7 @@ Environment=CELERY_QUEUE=%i
 
 # Django varsayımı (WSGI server zaten gunicorn)
 
-ExecStart=/srv/apps/%i/.venv/bin/celery \
+ExecStart=/srv/apps/%i/venv/bin/celery \
   -A %i worker \
   -Q ${CELERY_QUEUE} \
   --concurrency=${CELERY_CONCURRENCY} \
