@@ -13,6 +13,7 @@ Environment=PATH=/srv/apps/%i/venv/bin
 
 RuntimeDirectory=%i
 RuntimeDirectoryMode=0775
+RuntimeDirectoryPreserve=yes
 
 ExecStart=/srv/apps/%i/venv/bin/gunicorn %i.wsgi:application \
   --worker-class gthread \
@@ -28,9 +29,6 @@ ExecStart=/srv/apps/%i/venv/bin/gunicorn %i.wsgi:application \
   --group www-data \
   --access-logfile - \
   --error-logfile /var/log/%i/gunicorn-error.log
-
-ExecStartPost=/bin/chgrp www-data /run/%i/gunicorn.sock
-ExecStartPost=/bin/chmod 660 /run/%i/gunicorn.sock
 
 # Important difference vs hot tier
 Restart=on-failure

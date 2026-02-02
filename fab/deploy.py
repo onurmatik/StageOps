@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -68,6 +69,12 @@ def parse_backend_paths(raw: str) -> list[str]:
     return [p.strip().rstrip("/") for p in raw.split(",") if p.strip()]
 
 
+def parse_csv_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
 def get_github_token() -> str | None:
     script = SCRIPTS_DIR / "get_github_app_token.py"
     if not script.exists():
@@ -103,6 +110,32 @@ def upload_template(c: Connection, src: Path, dst: str, ctx: dict) -> None:
         c.sudo(f"mv {remote_tmp} {dst}")
     finally:
         os.remove(tmp_path)
+
+
+def shell_env_prefix(env: dict) -> str:
+    parts = []
+    for key, value in env.items():
+        if value is None:
+            continue
+        parts.append(f"{key}={shlex.quote(str(value))}")
+    return " ".join(parts)
+
+
+def purge_systemd_instance_units(
+    c: Connection, project: str, units: list[str]
+) -> None:
+    for unit in units:
+        instance = unit.replace("@.", f"@{project}.")
+        instance_path = f"/etc/systemd/system/{instance}"
+        instance_dropin = f"/etc/systemd/system/{instance}.d"
+        c.sudo(f"rm -f {instance_path}", warn=True)
+        c.sudo(f"rm -rf {instance_dropin}", warn=True)
+
+
+def disable_systemd_instances(c: Connection, project: str) -> None:
+    for unit in ["app", "node", "celery"]:
+        c.sudo(f"systemctl disable --now {unit}@{project}.service", warn=True)
+    c.sudo(f"systemctl disable --now app@{project}.socket", warn=True)
 
 def resolve_node_dir(raw: str | None, project_dir: str) -> str:
     if not raw:
@@ -170,6 +203,7 @@ def deploy(c, project):
     CELERY_QUEUE = env.get("CELERY_QUEUE", PROJECT_NAME)
 
     BACKEND_PATHS = env.get("BACKEND_PATHS", "")
+    LEGACY_PROJECT_NAMES = parse_csv_list(env.get("LEGACY_PROJECT_NAMES"))
 
     # --------------------------------------------------
     # SERVER PATHS
@@ -287,12 +321,40 @@ def deploy(c, project):
             c.run(node_build_cmd)
 
     # --------------------------------------------------
+    # DJANGO STATIC
+    # --------------------------------------------------
+
+    manage_py = f"{PROJECT_DIR}/manage.py"
+    skip_collectstatic = env.get("SKIP_COLLECTSTATIC") in {"1", "true", "yes"}
+    if not skip_collectstatic and c.run(f"test -f {manage_py}", warn=True).ok:
+        debug("Collecting Django static files")
+        with c.cd(PROJECT_DIR):
+            env_prefix = shell_env_prefix(env)
+            c.run(
+                f"{env_prefix} {VENV_DIR}/bin/python manage.py collectstatic --noinput"
+            )
+
+    # --------------------------------------------------
     # SYSTEMD UNITS
     # --------------------------------------------------
 
     debug("Installing systemd templates")
 
-    for unit in ["app@.service", "app@.socket", "node@.service", "celery@.service"]:
+    systemd_units = ["app@.service", "app@.socket", "node@.service", "celery@.service"]
+    keep_systemd_overrides = env.get("KEEP_SYSTEMD_OVERRIDES") in {"1", "true", "yes"}
+
+    if not keep_systemd_overrides:
+        debug("Removing stale systemd instance overrides")
+        purge_systemd_instance_units(c, PROJECT_NAME, systemd_units)
+
+    if LEGACY_PROJECT_NAMES and not keep_systemd_overrides:
+        debug(f"Removing legacy systemd instances: {', '.join(LEGACY_PROJECT_NAMES)}")
+        for legacy in LEGACY_PROJECT_NAMES:
+            disable_systemd_instances(c, legacy)
+            purge_systemd_instance_units(c, legacy, systemd_units)
+            c.sudo(f"rm -rf /run/{legacy}", warn=True)
+
+    for unit in systemd_units:
         c.put(SYSTEMD_DIR / unit, f"/tmp/{unit}")
         c.sudo(f"mv /tmp/{unit} /etc/systemd/system/{unit}")
 
@@ -333,6 +395,12 @@ def deploy(c, project):
         f"/etc/nginx/sites-available/{PROJECT_NAME}.conf",
         nginx_ctx,
     )
+
+    if LEGACY_PROJECT_NAMES:
+        debug(f"Removing legacy nginx sites: {', '.join(LEGACY_PROJECT_NAMES)}")
+        for legacy in LEGACY_PROJECT_NAMES:
+            c.sudo(f"rm -f /etc/nginx/sites-enabled/{legacy}.conf", warn=True)
+            c.sudo(f"rm -f /etc/nginx/sites-available/{legacy}.conf", warn=True)
 
     c.sudo(
         f"ln -sf /etc/nginx/sites-available/{PROJECT_NAME}.conf "
