@@ -208,6 +208,34 @@ Backend paths are configurable and rendered from template.
 
 ---
 
+## Cron Jobs
+
+Add per-app crons under `cron`. Each entry is a standard cron line.
+
+If the command does not start with an absolute path (or a shell/python prefix),
+StageOps treats it as a Django management command and expands it to:
+
+`/srv/apps/<project>/venv/bin/python manage.py <command>`
+
+Examples:
+
+```yaml
+apps:
+  mevzuat:
+    cron:
+      - "0 0 * * * fetch_new_docs"
+      - "30 2 * * 1 /srv/apps/mevzuat/venv/bin/python manage.py cleanup"
+      - "0 4 * * * {PROJECT_ENV_PATH}/python {PROJECT_PATH}/manage.py clearsessions"
+```
+
+Available placeholders:
+
+* `{PROJECT_PATH}` → `/srv/apps/<project>`
+* `{PROJECT_ENV_PATH}` → `/srv/apps/<project>/venv/bin`
+* `{PROJECT_NAME}` → `<project>`
+
+---
+
 ## Promotion Workflow
 
 When a project grows:

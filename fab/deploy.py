@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import tempfile
 from pathlib import Path
 
@@ -111,6 +112,9 @@ def validate_app(name: str, app: dict) -> dict:
             ["celery_queue"],
         )
 
+    if "cron" in app:
+        app["cron"] = parse_cron_entries(app.get("cron"))
+
     return app
 
 
@@ -166,6 +170,17 @@ def parse_backend_paths(raw: object) -> list[str]:
     return [p.rstrip("/") for p in paths]
 
 
+def parse_cron_entries(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    raise RuntimeError("cron must be a list of cron strings.")
+
+
 def render_template(text: str, ctx: dict) -> str:
     for k, v in ctx.items():
         text = text.replace(f"{{{k}}}", str(v))
@@ -219,6 +234,105 @@ def resolve_node_dir(raw: str | None, project_dir: str) -> str:
     return f"{project_dir}/{raw}"
 
 
+def split_cron_entry(entry: str) -> tuple[str, str]:
+    text = entry.strip()
+    if not text:
+        raise RuntimeError("cron entry cannot be empty.")
+    if text.startswith("#"):
+        raise RuntimeError("cron entry cannot be a comment.")
+    if text.startswith("@"):
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            raise RuntimeError(f"Invalid cron entry: {entry}")
+        return parts[0], parts[1]
+    parts = text.split()
+    if len(parts) < 6:
+        raise RuntimeError(f"Invalid cron entry: {entry}")
+    schedule = " ".join(parts[:5])
+    command = " ".join(parts[5:])
+    return schedule, command
+
+
+def normalize_cron_command(command: str, project_dir: str, project_name: str) -> str:
+    project_env_path = f"{project_dir}/venv/bin"
+    ctx = {
+        "PROJECT_PATH": project_dir,
+        "PROJECT_ENV_PATH": project_env_path,
+        "PROJECT_NAME": project_name,
+    }
+
+    if "{PROJECT_" in command:
+        return render_template(command, ctx).strip()
+
+    trimmed = command.strip()
+    if not trimmed:
+        raise RuntimeError("cron command cannot be empty.")
+
+    raw_prefixes = (
+        "/",
+        "./",
+        "bash ",
+        "sh ",
+        "python ",
+        "pip ",
+        "manage.py ",
+        "django-admin ",
+        "celery ",
+        "gunicorn ",
+    )
+    if trimmed.startswith(raw_prefixes) or trimmed.startswith("$"):
+        return trimmed
+
+    return f"{project_env_path}/python manage.py {trimmed}"
+
+
+def cron_bash_command(project_dir: str, command: str) -> str:
+    env_file = f"{project_dir}/.env"
+    snippet = (
+        "set -a; "
+        f'if [ -f "{env_file}" ]; then . "{env_file}"; fi; '
+        "set +a; "
+        f'cd "{project_dir}"; '
+        f"{command}"
+    )
+    return f"/bin/bash -lc {shlex.quote(snippet)}"
+
+
+def build_cron_lines(
+    *,
+    entries: list[str],
+    user: str,
+    project_dir: str,
+    project_name: str,
+) -> list[str]:
+    lines = [
+        f"# StageOps cron for {project_name}",
+        "SHELL=/bin/bash",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]
+
+    for entry in entries:
+        if entry.strip().startswith("#"):
+            continue
+        schedule, command = split_cron_entry(entry)
+        normalized = normalize_cron_command(command, project_dir, project_name)
+        bash_cmd = cron_bash_command(project_dir, normalized)
+        lines.append(f"{schedule} {user} {bash_cmd}")
+
+    return lines
+
+
+def install_cron(c: Connection, project_name: str, lines: list[str]) -> None:
+    cron_path = f"/etc/cron.d/stageops-{project_name}"
+    if not lines or len(lines) <= 3:
+        c.sudo(f"rm -f {cron_path}", warn=True)
+        return
+    content = "\n".join(lines) + "\n"
+    upload_text(c, content, cron_path)
+    c.sudo(f"chmod 644 {cron_path}")
+    c.sudo(f"chown root:root {cron_path}")
+
+
 def render_project_template(value: str, project_name: str) -> str:
     return value.replace("{PROJECT_NAME}", project_name)
 
@@ -243,6 +357,7 @@ def setup_app(c: Connection, server: dict, app: dict) -> None:
 
     BACKEND_PATHS = parse_backend_paths(app["backend_paths"])
     LEGACY_PROJECT_NAMES = parse_list(app.get("legacy_projects"))
+    CRON_ENTRIES = parse_cron_entries(app.get("cron"))
 
     GUNICORN_WORKER_CLASS = app["gunicorn_worker_class"]
     GUNICORN_WORKERS = int(app["gunicorn_workers"])
@@ -273,6 +388,18 @@ def setup_app(c: Connection, server: dict, app: dict) -> None:
     c.sudo(f"chown -R {USER}:{USER} {PROJECT_DIR} {LOG_DIR}")
     c.sudo(f"chown {USER}:www-data {RUN_DIR}")
     c.sudo(f"chmod 2775 {RUN_DIR}")
+
+    # --------------------------------------------------
+    # CRON
+    # --------------------------------------------------
+
+    cron_lines = build_cron_lines(
+        entries=CRON_ENTRIES,
+        user=USER,
+        project_dir=PROJECT_DIR,
+        project_name=PROJECT_NAME,
+    )
+    install_cron(c, PROJECT_NAME, cron_lines)
 
     # --------------------------------------------------
     # SYSTEMD UNITS

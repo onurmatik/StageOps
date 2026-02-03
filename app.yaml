@@ -1,0 +1,74 @@
+# StageOps infra configuration (single file)
+
+server:
+  host: 18.206.25.249
+  user: ubuntu
+  ssh_key: ~/.ssh/stage-ec2-key.pem
+  log_access: /var/log/{PROJECT_NAME}/gunicorn-access.log
+  log_errors: /var/log/{PROJECT_NAME}/gunicorn-error.log
+
+apps:
+  mevzuat:
+    project_name: mevzuat
+    domain: mevzuat.info
+    tier: cold
+
+    enable_node: true
+    node_dir: frontend/
+    node_port: 3020
+    node_start_cmd: npm run preview -- --host 127.0.0.1 --port $PORT
+
+    enable_celery: true
+    celery_queue: mevzuat
+
+    cron:
+      - "0 0 * * * fetch_new_docs"
+
+    backend_paths:
+      - /api
+      - /mAdmin
+      - /rss
+
+    gunicorn_worker_class: gthread
+    gunicorn_workers: 1
+    gunicorn_threads: 2
+    gunicorn_timeout: 60
+    gunicorn_graceful_timeout: 30
+    gunicorn_max_requests: 500
+    gunicorn_max_requests_jitter: 50
+
+    memory_limit: 400M
+    cpu_quota: 40%
+
+    legacy_projects: []
+
+  newsradar:
+    project_name: newsradar
+    domain: newsradar.app
+    tier: cold
+
+    enable_node: true
+    node_dir: frontend/
+    node_port: 3010
+    node_start_cmd: npm run preview -- --host 127.0.0.1 --port $PORT
+
+    enable_celery: true
+    celery_queue: newsradar
+
+    backend_paths:
+      - /api
+      - /nrAdmin
+      - /rss
+
+    gunicorn_worker_class: gthread
+    gunicorn_workers: 1
+    gunicorn_threads: 2
+    gunicorn_timeout: 60
+    gunicorn_graceful_timeout: 30
+    gunicorn_max_requests: 500
+    gunicorn_max_requests_jitter: 50
+
+    memory_limit: 400M
+    cpu_quota: 40%
+
+    legacy_projects: []
