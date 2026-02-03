@@ -1,4 +1,4 @@
 fabric
-python-dotenv
+PyYAML
 requests
 PyJWT

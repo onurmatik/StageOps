@@ -46,8 +46,7 @@ StageOps/
 ├── fab/
 │   └── deploy.py          # Main Fabric entrypoint
 │
-├── envs/
-│   └── newsradar.env      # Per-project environment & config
+├── app.yaml               # Per-project infra config
 │
 ├── templates/
 │   ├── systemd/
@@ -91,39 +90,42 @@ Each project belongs to one tier.
 * No services enabled
 * No nginx config
 
-Tier is defined per project in its env file.
-
-```env
-TIER=hot | cold | dormant
-```
+Tier is defined per project in `app.yaml`.
 
 ---
 
 ## Per-Project Configuration
 
-Each project has **one env file** under `envs/`.
+All infra configuration lives in a single `app.yaml`.
 
-Example: `envs/newsradar.env`
+Example:
 
-```env
-# Identity
-PROJECT_NAME=newsradar
+```yaml
+server:
+  host: 18.206.25.249
+  user: ubuntu
+  ssh_key: ~/.ssh/stage-ec2-key.pem
+  log_access: /var/log/{PROJECT_NAME}/gunicorn-access.log
+  log_errors: /var/log/{PROJECT_NAME}/gunicorn-error.log
 
-# Tier
-TIER=cold
-
-# Networking
-DOMAIN=newsradar.app
-
-# Runtime capabilities
-ENABLE_NODE=0
-ENABLE_CELERY=1
-CELERY_QUEUE=newsradar
-
-# Resource hints
-WORKERS=1
-THREADS=2
-MEMORY_LIMIT=400M
+apps:
+  newsradar:
+    project_name: newsradar
+    domain: newsradar.app
+    tier: cold
+    enable_node: false
+    enable_celery: true
+    celery_queue: newsradar
+    backend_paths: ["/api"]
+    gunicorn_worker_class: gthread
+    gunicorn_workers: 1
+    gunicorn_threads: 2
+    gunicorn_timeout: 60
+    gunicorn_graceful_timeout: 30
+    gunicorn_max_requests: 500
+    gunicorn_max_requests_jitter: 50
+    memory_limit: 400M
+    cpu_quota: 40%
 ```
 
 No project-specific logic lives in StageOps code.
@@ -136,19 +138,26 @@ Only data.
 From the **StageOps repo**:
 
 ```bash
-fab deploy:newsradar
+fab infra
+```
+
+Filter to specific apps:
+
+```bash
+fab infra --only=mevzuat,newsradar
 ```
 
 What this does:
 
-1. Loads `envs/newsradar.env`
+1. Loads `app.yaml`
 2. Connects to the staging server
-3. Ensures base directories exist
-4. Installs systemd templates (once)
-5. Renders project-specific systemd units
-6. Renders nginx config
-7. Enables services based on tier
-8. Reloads systemd and nginx
+3. Iterates all apps defined in `app.yaml`
+4. Ensures base directories exist
+5. Installs systemd templates
+6. Renders project-specific systemd overrides
+7. Renders nginx config
+8. Enables services based on tier
+9. Reloads systemd and nginx
 
 ---
 
@@ -219,7 +228,7 @@ StageOps is intentionally **not** production tooling.
 StageOps intentionally does **not**:
 
 * Manage databases
-* Manage secrets beyond `.env`
+* Manage secrets outside StageOps
 * Handle autoscaling
 * Replace CI/CD
 * Support Kubernetes or Docker

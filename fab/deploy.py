@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import os
-import sys
-import shlex
-import subprocess
 import tempfile
 from pathlib import Path
 
+import yaml
 from fabric import Connection, task
 from invoke import Collection
-from dotenv import dotenv_values
 
 # ==================================================
 # PATHS
@@ -17,95 +14,156 @@ from dotenv import dotenv_values
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-ENVS_DIR = BASE_DIR / "envs"
+CONFIG_PATH = BASE_DIR / "app.yaml"
 TEMPLATES_DIR = BASE_DIR / "templates"
 SYSTEMD_DIR = TEMPLATES_DIR / "systemd"
 SCRIPTS_DIR = BASE_DIR / "scripts"
 
 # ==================================================
-# DEFAULTS (stage-level)
-# ==================================================
-
-DEFAULTS = {
-    "HOST": "18.206.25.249",
-    "USER": "ubuntu",
-    "SSH_KEY": "~/.ssh/stage-ec2-key.pem",
-    "BRANCH": "main",
-    "WORKERS": "1",
-    "THREADS": "2",
-    "MEMORY_LIMIT": "400M",
-    "ENABLE_NODE": "0",
-    "ENABLE_CELERY": "0",
-    "TIER": "cold",
-}
-
-# ==================================================
 # HELPERS
 # ==================================================
+
 
 def debug(msg: str) -> None:
     print(f"[stageops] {msg}")
 
-def load_project_env(project: str) -> dict:
-    env_path = ENVS_DIR / f"{project}.env"
-    if not env_path.exists():
-        raise RuntimeError(f"Env file not found: {env_path}")
+
+def load_yaml_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise RuntimeError(f"Config file not found: {CONFIG_PATH}")
+    data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError("Config must be a mapping at the top level.")
+    return data
 
 
-    raw = dotenv_values(env_path)
-    env = {**DEFAULTS, **{k: v for k, v in raw.items() if v is not None}}
-
-    required = ["PROJECT_NAME", "DOMAIN", "REPO_URL"]
-    for key in required:
-        if not env.get(key):
-            raise RuntimeError(f"{key} is required in {env_path}")
-
-    return env
-
-
-def parse_backend_paths(raw: str) -> list[str]:
+def normalize_apps(raw: object) -> dict:
     if not raw:
-        return []
-    return [p.strip().rstrip("/") for p in raw.split(",") if p.strip()]
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        apps: dict[str, dict] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                raise RuntimeError("Each app entry must be a mapping.")
+            name = item.get("name") or item.get("project_name")
+            if not name:
+                raise RuntimeError("Each app entry must have a name.")
+            apps[name] = item
+        return apps
+    raise RuntimeError("apps must be a mapping or a list of mappings.")
+
+def require_mapping(value: object, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} must be a mapping.")
+    return value
 
 
-def parse_csv_list(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    return [p.strip() for p in raw.split(",") if p.strip()]
+def require_keys(label: str, mapping: dict, keys: list[str]) -> None:
+    missing = []
+    for key in keys:
+        if key not in mapping:
+            missing.append(key)
+            continue
+        if mapping[key] is None:
+            missing.append(key)
+    if missing:
+        joined = ", ".join(missing)
+        raise RuntimeError(f"{label} missing required keys: {joined}")
 
 
-def load_local_env() -> dict:
-    env = os.environ.copy()
-    local_env = dotenv_values(BASE_DIR / ".env")
-    env.update({k: v for k, v in local_env.items() if v is not None})
-    return env
+def validate_app(name: str, app: dict) -> dict:
+    app_name = app.get("project_name") or app.get("name") or name
+    app["project_name"] = app_name
 
-
-def get_github_token() -> str | None:
-    script = SCRIPTS_DIR / "get_github_app_token.py"
-    if not script.exists():
-        return None
-
-    env = load_local_env()
-    if not env.get("GITHUB_APP_ID") or not env.get("GITHUB_APP_INSTALLATION_ID"):
-        return None
-
-    result = subprocess.run(
-        [sys.executable, str(script)],
-        capture_output=True,
-        text=True,
-        env=env,
+    require_keys(
+        f"apps.{name}",
+        app,
+        [
+            "domain",
+            "tier",
+            "enable_node",
+            "enable_celery",
+            "backend_paths",
+            "gunicorn_worker_class",
+            "gunicorn_workers",
+            "gunicorn_threads",
+            "gunicorn_timeout",
+            "gunicorn_graceful_timeout",
+            "gunicorn_max_requests",
+            "gunicorn_max_requests_jitter",
+            "memory_limit",
+        ],
     )
 
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"GitHub App token error: {detail}")
+    if as_bool(app.get("enable_node")):
+        require_keys(
+            f"apps.{name}",
+            app,
+            ["node_dir", "node_port", "node_start_cmd"],
+        )
 
-    token = result.stdout.strip()
-    if not token:
-        raise RuntimeError("GitHub App token script returned empty output.")
-    return token
+    if as_bool(app.get("enable_celery")):
+        require_keys(
+            f"apps.{name}",
+            app,
+            ["celery_queue"],
+        )
+
+    return app
+
+
+def load_all_configs(only: list[str] | None = None) -> tuple[dict, list[dict]]:
+    config = load_yaml_config()
+    server = require_mapping(config.get("server"), "server")
+    require_keys("server", server, ["host", "user", "ssh_key", "log_access", "log_errors"])
+
+    raw_apps = normalize_apps(config.get("apps"))
+    if not raw_apps:
+        raise RuntimeError(f"No apps found in {CONFIG_PATH}")
+
+    if only:
+        missing = [name for name in only if name not in raw_apps]
+        if missing:
+            raise RuntimeError(f"Unknown apps in --only: {', '.join(missing)}")
+        app_items = [(name, raw_apps[name]) for name in only]
+    else:
+        app_items = list(raw_apps.items())
+
+    apps: list[dict] = []
+    for name, raw in app_items:
+        app = require_mapping(raw, f"apps.{name}")
+        apps.append(validate_app(name, app))
+
+    return server, apps
+
+
+def as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def parse_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    raise RuntimeError("Expected a list or comma-separated string.")
+
+
+def parse_backend_paths(raw: object) -> list[str]:
+    paths = parse_list(raw)
+    return [p.rstrip("/") for p in paths]
 
 
 def render_template(text: str, ctx: dict) -> str:
@@ -114,14 +172,12 @@ def render_template(text: str, ctx: dict) -> str:
     return text
 
 
-def upload_template(c: Connection, src: Path, dst: str, ctx: dict) -> None:
-    rendered = render_template(src.read_text(), ctx)
-
+def upload_text(c: Connection, text: str, dst: str) -> None:
     with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
-        tmp.write(rendered)
+        tmp.write(text)
         tmp_path = tmp.name
 
-    remote_tmp = f"/tmp/{src.name}"
+    remote_tmp = f"/tmp/{Path(dst).name}"
 
     try:
         c.put(tmp_path, remote_tmp)
@@ -130,13 +186,9 @@ def upload_template(c: Connection, src: Path, dst: str, ctx: dict) -> None:
         os.remove(tmp_path)
 
 
-def shell_env_prefix(env: dict) -> str:
-    parts = []
-    for key, value in env.items():
-        if value is None:
-            continue
-        parts.append(f"{key}={shlex.quote(str(value))}")
-    return " ".join(parts)
+def upload_template(c: Connection, src: Path, dst: str, ctx: dict) -> None:
+    rendered = render_template(src.read_text(), ctx)
+    upload_text(c, rendered, dst)
 
 
 def purge_systemd_instance_units(
@@ -155,104 +207,63 @@ def disable_systemd_instances(c: Connection, project: str) -> None:
         c.sudo(f"systemctl disable --now {unit}@{project}.service", warn=True)
     c.sudo(f"systemctl disable --now app@{project}.socket", warn=True)
 
+
 def resolve_node_dir(raw: str | None, project_dir: str) -> str:
     if not raw:
         return project_dir
-    raw = raw.strip()
+    raw = str(raw).strip()
     if raw.startswith(("'", '"')) and raw.endswith(raw[0]) and len(raw) >= 2:
         raw = raw[1:-1]
     if raw.startswith("/"):
         return raw
     return f"{project_dir}/{raw}"
 
-def normalize_env_text(env_text: str, project_dir: str) -> str:
-    lines = env_text.splitlines()
-    out = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            out.append(line)
-            continue
-        key, sep, value = line.partition("=")
-        if key.strip() != "NODE_DIR" or not sep:
-            out.append(line)
-            continue
-        raw = value.strip()
-        quote = ""
-        if raw.startswith(("'", '"')) and raw.endswith(raw[0]) and len(raw) >= 2:
-            quote = raw[0]
-            raw = raw[1:-1]
-        resolved = resolve_node_dir(raw, project_dir)
-        new_val = f"{quote}{resolved}{quote}" if quote else resolved
-        out.append(f"{key}{sep}{new_val}")
-    return "\n".join(out) + ("\n" if env_text.endswith("\n") else "")
+
+def render_project_template(value: str, project_name: str) -> str:
+    return value.replace("{PROJECT_NAME}", project_name)
 
 
-# ==================================================
-# DEPLOY TASK
-# ==================================================
+def setup_app(c: Connection, server: dict, app: dict) -> None:
+    PROJECT_NAME = app["project_name"]
+    DOMAIN = app["domain"]
 
-@task
-def deploy(c, project):
-    """
-    Deploy a project using StageOps.
+    USER = server["user"]
+    LOG_ACCESS = render_project_template(server["log_access"], PROJECT_NAME)
+    LOG_ERRORS = render_project_template(server["log_errors"], PROJECT_NAME)
 
-    Usage:
-        fab deploy:newsradar
-    """
-    env_path = ENVS_DIR / f"{project}.env"
-    env = load_project_env(project)
+    TIER = app["tier"]
 
-    PROJECT_NAME = env["PROJECT_NAME"]
-    DOMAIN = env["DOMAIN"]
-    REPO_URL = env["REPO_URL"]
-    BRANCH = env["BRANCH"]
+    ENABLE_NODE = as_bool(app["enable_node"])
+    NODE_PORT = int(app["node_port"]) if ENABLE_NODE else None
+    NODE_DIR = app.get("node_dir")
+    NODE_START_CMD = app.get("node_start_cmd")
 
-    HOST = env["HOST"]
-    USER = env["USER"]
-    SSH_KEY = os.path.expanduser(env["SSH_KEY"])
+    ENABLE_CELERY = as_bool(app["enable_celery"])
+    CELERY_QUEUE = app["celery_queue"] if ENABLE_CELERY else None
 
-    TIER = env["TIER"]
+    BACKEND_PATHS = parse_backend_paths(app["backend_paths"])
+    LEGACY_PROJECT_NAMES = parse_list(app.get("legacy_projects"))
 
-    ENABLE_NODE = env.get("ENABLE_NODE") in {"1", "true", "yes"}
-    NODE_PORT = env.get("NODE_PORT", "3000")
+    GUNICORN_WORKER_CLASS = app["gunicorn_worker_class"]
+    GUNICORN_WORKERS = int(app["gunicorn_workers"])
+    GUNICORN_THREADS = int(app["gunicorn_threads"])
+    GUNICORN_TIMEOUT = int(app["gunicorn_timeout"])
+    GUNICORN_GRACEFUL_TIMEOUT = int(app["gunicorn_graceful_timeout"])
+    GUNICORN_MAX_REQUESTS = int(app["gunicorn_max_requests"])
+    GUNICORN_MAX_REQUESTS_JITTER = int(app["gunicorn_max_requests_jitter"])
 
-    ENABLE_CELERY = env.get("ENABLE_CELERY") in {"1", "true", "yes"}
-    CELERY_QUEUE = env.get("CELERY_QUEUE", PROJECT_NAME)
-
-    BACKEND_PATHS = env.get("BACKEND_PATHS", "")
-    LEGACY_PROJECT_NAMES = parse_csv_list(env.get("LEGACY_PROJECT_NAMES"))
+    MEMORY_LIMIT = app.get("memory_limit")
+    CPU_QUOTA = app.get("cpu_quota")
 
     # --------------------------------------------------
     # SERVER PATHS
     # --------------------------------------------------
 
     PROJECT_DIR = f"/srv/apps/{PROJECT_NAME}"
-    VENV_DIR = f"{PROJECT_DIR}/venv"
     LOG_DIR = f"/var/log/{PROJECT_NAME}"
     RUN_DIR = f"/run/{PROJECT_NAME}"
 
     GUNICORN_SOCKET = f"{RUN_DIR}/gunicorn.sock"
-
-    # --------------------------------------------------
-    # CONNECTION
-    # --------------------------------------------------
-
-    debug(f"Deploying {PROJECT_NAME} ({TIER})")
-
-    c = Connection(
-        host=HOST,
-        user=USER,
-        connect_kwargs={"key_filename": SSH_KEY},
-    )
-
-    # --------------------------------------------------
-    # VERIFY HOST
-    # --------------------------------------------------
-
-    debug("Running host verification")
-    c.put(SCRIPTS_DIR / "verify_host.sh", "/tmp/verify_host.sh")
-    c.run("bash /tmp/verify_host.sh")
 
     # --------------------------------------------------
     # DIRECTORIES
@@ -264,110 +275,17 @@ def deploy(c, project):
     c.sudo(f"chmod 2775 {RUN_DIR}")
 
     # --------------------------------------------------
-    # CLONE / UPDATE REPO
-    # --------------------------------------------------
-
-    token = get_github_token()
-    if not token and REPO_URL.startswith("https://"):
-        debug("No GitHub App token configured; cloning without auth (public repos only).")
-
-    if c.run(f"test -d {PROJECT_DIR}/.git", warn=True).failed:
-        debug("Cloning repository")
-        clone_url = REPO_URL
-        if token and REPO_URL.startswith("https://"):
-            clone_url = REPO_URL.replace(
-                "https://", f"https://x-access-token:{token}@"
-            )
-        c.run(f"git clone -b {BRANCH} {clone_url} {PROJECT_DIR}")
-    else:
-        debug("Updating repository")
-        with c.cd(PROJECT_DIR):
-            c.run("git fetch")
-            c.run(f"git reset --hard origin/{BRANCH}")
-
-    # --------------------------------------------------
-    # PROJECT ENV
-    # --------------------------------------------------
-
-    debug("Uploading project .env")
-    env_text = normalize_env_text(env_path.read_text(), PROJECT_DIR)
-    with tempfile.NamedTemporaryFile("w", delete=False) as tmp_env:
-        tmp_env.write(env_text)
-        tmp_env_path = tmp_env.name
-
-    remote_env_tmp = f"/tmp/{PROJECT_NAME}.env"
-    try:
-        c.put(tmp_env_path, remote_env_tmp)
-        c.sudo(f"mv {remote_env_tmp} {PROJECT_DIR}/.env")
-        c.sudo(f"chown {USER}:{USER} {PROJECT_DIR}/.env")
-        c.sudo(f"chmod 600 {PROJECT_DIR}/.env")
-    finally:
-        os.remove(tmp_env_path)
-
-    # --------------------------------------------------
-    # PYTHON ENV
-    # --------------------------------------------------
-
-    if c.run(f"test -d {VENV_DIR}", warn=True).failed:
-        debug("Creating virtualenv")
-        c.run(f"python3 -m venv {VENV_DIR}")
-
-    with c.cd(PROJECT_DIR):
-        debug("Installing Python dependencies")
-        c.run(f"{VENV_DIR}/bin/pip install -U pip")
-        c.run(f"{VENV_DIR}/bin/pip install -r requirements.txt", warn=True)
-
-    # --------------------------------------------------
-    # NODE / FRONTEND
-    # --------------------------------------------------
-
-    if ENABLE_NODE:
-        node_dir = resolve_node_dir(env.get("NODE_DIR"), PROJECT_DIR)
-        debug("Preparing frontend")
-
-        if c.run(f"test -f {node_dir}/package.json", warn=True).failed:
-            raise RuntimeError(
-                f"package.json not found at {node_dir}. "
-                f"Set NODE_DIR in {env_path}."
-            )
-
-        node_install_cmd = env.get("NODE_INSTALL_CMD") or "npm install"
-        node_build_cmd = env.get("NODE_BUILD_CMD") or "npm run build --if-present"
-
-        with c.cd(node_dir):
-            debug("Installing Node dependencies")
-            c.run(node_install_cmd)
-            debug("Building frontend")
-            c.run(node_build_cmd)
-
-    # --------------------------------------------------
-    # DJANGO STATIC
-    # --------------------------------------------------
-
-    manage_py = f"{PROJECT_DIR}/manage.py"
-    skip_collectstatic = env.get("SKIP_COLLECTSTATIC") in {"1", "true", "yes"}
-    if not skip_collectstatic and c.run(f"test -f {manage_py}", warn=True).ok:
-        debug("Collecting Django static files")
-        with c.cd(PROJECT_DIR):
-            env_prefix = shell_env_prefix(env)
-            c.run(
-                f"{env_prefix} {VENV_DIR}/bin/python manage.py collectstatic --noinput"
-            )
-
-    # --------------------------------------------------
     # SYSTEMD UNITS
     # --------------------------------------------------
 
     debug("Installing systemd templates")
 
     systemd_units = ["app@.service", "app@.socket", "node@.service", "celery@.service"]
-    keep_systemd_overrides = env.get("KEEP_SYSTEMD_OVERRIDES") in {"1", "true", "yes"}
 
-    if not keep_systemd_overrides:
-        debug("Removing stale systemd instance overrides")
-        purge_systemd_instance_units(c, PROJECT_NAME, systemd_units)
+    debug("Removing stale systemd instance overrides")
+    purge_systemd_instance_units(c, PROJECT_NAME, systemd_units)
 
-    if LEGACY_PROJECT_NAMES and not keep_systemd_overrides:
+    if LEGACY_PROJECT_NAMES:
         debug(f"Removing legacy systemd instances: {', '.join(LEGACY_PROJECT_NAMES)}")
         for legacy in LEGACY_PROJECT_NAMES:
             disable_systemd_instances(c, legacy)
@@ -378,12 +296,72 @@ def deploy(c, project):
         c.put(SYSTEMD_DIR / unit, f"/tmp/{unit}")
         c.sudo(f"mv /tmp/{unit} /etc/systemd/system/{unit}")
 
+    # Per-app systemd overrides
+
+    gunicorn_exec = (
+        "/bin/sh -lc "
+        f"\"/srv/apps/%i/venv/bin/gunicorn %i.wsgi:application "
+        f"--worker-class {GUNICORN_WORKER_CLASS} "
+        f"--workers {GUNICORN_WORKERS} "
+        f"--threads {GUNICORN_THREADS} "
+        f"--timeout {GUNICORN_TIMEOUT} "
+        f"--graceful-timeout {GUNICORN_GRACEFUL_TIMEOUT} "
+        f"--max-requests {GUNICORN_MAX_REQUESTS} "
+        f"--max-requests-jitter {GUNICORN_MAX_REQUESTS_JITTER} "
+        f"--bind unix:/run/%i/gunicorn.sock "
+        f"--umask 007 "
+        f"--user ubuntu "
+        f"--group www-data "
+        f"--access-logfile {LOG_ACCESS} "
+        f"--error-logfile {LOG_ERRORS}\""
+    )
+
+    app_dropin = build_dropin(
+        directives={
+            "MemoryMax": MEMORY_LIMIT,
+            "CPUQuota": CPU_QUOTA,
+        },
+        exec_start=gunicorn_exec,
+    )
+    write_dropin(c, f"app@{PROJECT_NAME}.service", app_dropin)
+
+    if ENABLE_NODE:
+        node_dir = resolve_node_dir(NODE_DIR, PROJECT_DIR)
+        node_dropin = build_dropin(
+            env={
+                "NODE_PORT": NODE_PORT,
+                "NODE_DIR": node_dir,
+                "NODE_START_CMD": NODE_START_CMD,
+            },
+            directives={
+                "MemoryMax": MEMORY_LIMIT,
+                "CPUQuota": CPU_QUOTA,
+            },
+        )
+        write_dropin(c, f"node@{PROJECT_NAME}.service", node_dropin)
+    else:
+        c.sudo(f"systemctl disable --now node@{PROJECT_NAME}.service", warn=True)
+
+    if ENABLE_CELERY:
+        celery_dropin = build_dropin(
+            env={
+                "CELERY_QUEUE": CELERY_QUEUE,
+            },
+            directives={
+                "MemoryMax": MEMORY_LIMIT,
+                "CPUQuota": CPU_QUOTA,
+            },
+        )
+        write_dropin(c, f"celery@{PROJECT_NAME}.service", celery_dropin)
+    else:
+        c.sudo(f"systemctl disable --now celery@{PROJECT_NAME}.service", warn=True)
+
     # --------------------------------------------------
     # NGINX
     # --------------------------------------------------
 
     backend_locations = []
-    for path in parse_backend_paths(BACKEND_PATHS):
+    for path in BACKEND_PATHS:
         backend_locations.append(
             f"""location ^~ {path}/ {{
             proxy_pass http://unix:{GUNICORN_SOCKET}:;
@@ -391,7 +369,8 @@ def deploy(c, project):
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-        }}""")
+        }}"""
+        )
 
     BACKEND_LOCATIONS = "\n\n".join(backend_locations)
 
@@ -434,32 +413,121 @@ def deploy(c, project):
     c.sudo("systemctl daemon-reload")
 
     if TIER == "hot":
-        c.sudo(f"systemctl enable --now app@{PROJECT_NAME}")
+        c.sudo(f"systemctl enable --now app@{PROJECT_NAME}.service")
+        c.sudo(f"systemctl disable --now app@{PROJECT_NAME}.socket", warn=True)
     else:
         c.sudo(f"systemctl enable --now app@{PROJECT_NAME}.socket")
 
     if ENABLE_NODE:
-        c.sudo(f"systemctl enable --now node@{PROJECT_NAME}")
+        c.sudo(f"systemctl enable --now node@{PROJECT_NAME}.service")
 
     if ENABLE_CELERY:
-        c.sudo(f"systemctl enable --now celery@{PROJECT_NAME}")
+        c.sudo(f"systemctl enable --now celery@{PROJECT_NAME}.service")
 
     c.sudo("nginx -t")
     c.sudo("systemctl reload nginx")
 
     debug("Restarting services")
     if TIER == "hot":
-        c.sudo(f"systemctl restart app@{PROJECT_NAME}")
+        c.sudo(f"systemctl restart app@{PROJECT_NAME}.service")
     else:
         c.sudo(f"systemctl restart app@{PROJECT_NAME}.socket")
         c.sudo(f"systemctl try-restart app@{PROJECT_NAME}.service")
 
     if ENABLE_NODE:
-        c.sudo(f"systemctl restart node@{PROJECT_NAME}")
+        c.sudo(f"systemctl restart node@{PROJECT_NAME}.service")
 
     if ENABLE_CELERY:
-        c.sudo(f"systemctl restart celery@{PROJECT_NAME}")
+        c.sudo(f"systemctl restart celery@{PROJECT_NAME}.service")
 
-    debug("Deploy completed successfully")
 
-ns = Collection(deploy)
+def systemd_quote(value: object) -> str:
+    text = str(value)
+    text = text.replace("\\", "\\\\").replace('"', "\\\"")
+    return f'"{text}"'
+
+
+def systemd_env_lines(env: dict[str, object]) -> list[str]:
+    lines = []
+    for key, value in env.items():
+        if value is None:
+            continue
+        lines.append(f"Environment={systemd_quote(f'{key}={value}')}")
+    return lines
+
+
+def build_dropin(
+    *,
+    env: dict[str, object] | None = None,
+    directives: dict[str, object] | None = None,
+    exec_start: str | None = None,
+) -> str:
+    lines = ["[Service]"]
+
+    if env:
+        lines.extend(systemd_env_lines(env))
+
+    if exec_start:
+        lines.append("ExecStart=")
+        lines.append(f"ExecStart={exec_start}")
+
+    if directives:
+        for key, value in directives.items():
+            if value is None:
+                continue
+            lines.append(f"{key}={value}")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_dropin(c: Connection, unit_name: str, content: str) -> None:
+    dropin_dir = f"/etc/systemd/system/{unit_name}.d"
+    dropin_path = f"{dropin_dir}/10-stageops.conf"
+    c.sudo(f"mkdir -p {dropin_dir}")
+    upload_text(c, content, dropin_path)
+
+
+# ==================================================
+# DEPLOY TASK
+# ==================================================
+
+
+@task
+def infra(c, only=None):
+    """
+    Setup infra for all apps using StageOps.
+
+    Usage:
+        fab infra
+        fab infra --only=mevzuat,newsradar
+    """
+    only_list = parse_list(only) if only else []
+    server, apps = load_all_configs(only_list or None)
+
+    HOST = server["host"]
+    USER = server["user"]
+    SSH_KEY = os.path.expanduser(server["ssh_key"])
+
+    if only_list:
+        debug(f"Setting up infra for {len(apps)} apps (filtered)")
+    else:
+        debug(f"Setting up infra for {len(apps)} apps")
+
+    c = Connection(
+        host=HOST,
+        user=USER,
+        connect_kwargs={"key_filename": SSH_KEY},
+    )
+
+    debug("Running host verification")
+    c.put(SCRIPTS_DIR / "verify_host.sh", "/tmp/verify_host.sh")
+    c.run("bash /tmp/verify_host.sh")
+
+    for app in apps:
+        debug(f"Setting up {app['project_name']}")
+        setup_app(c, server, app)
+
+    debug("Infra setup completed successfully")
+
+
+ns = Collection(infra)
