@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import shlex
 import tempfile
+from difflib import get_close_matches
 from pathlib import Path
 
 import yaml
 from fabric import Connection, task
-from invoke import Collection
+from invoke import Collection, Exit
 
 # ==================================================
 # PATHS
@@ -191,6 +192,15 @@ def parse_cron_entries(value: object) -> list[str]:
         text = value.strip()
         return [text] if text else []
     raise RuntimeError("cron must be a list of cron strings.")
+
+
+def available_app_names() -> list[str]:
+    try:
+        config = load_yaml_config()
+        raw_apps = normalize_apps(config.get("apps"))
+        return sorted(raw_apps.keys())
+    except Exception:
+        return []
 
 
 def render_template(text: str, ctx: dict) -> str:
@@ -641,7 +651,27 @@ def infra(c, only=None):
         fab infra --only=mevzuat,newsradar
     """
     only_list = parse_list(only) if only else []
-    server, apps = load_all_configs(only_list or None)
+    try:
+        server, apps = load_all_configs(only_list or None)
+    except RuntimeError as exc:
+        available = available_app_names()
+        missing = []
+        if only_list:
+            missing = [name for name in only_list if name not in available] if available else only_list
+
+        lines = [str(exc)]
+        if available:
+            lines.append(f"Available apps: {', '.join(available)}")
+            if missing:
+                suggestions = []
+                for name in missing:
+                    matches = get_close_matches(name, available, n=2, cutoff=0.6)
+                    if matches:
+                        suggestions.append(f"{name} -> {', '.join(matches)}")
+                if suggestions:
+                    lines.append(f"Did you mean: {'; '.join(suggestions)}")
+
+        raise Exit("\n".join(lines), code=1)
 
     HOST = server["host"]
     USER = server["user"]
