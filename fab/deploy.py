@@ -75,19 +75,37 @@ def parse_csv_list(raw: str | None) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def load_local_env() -> dict:
+    env = os.environ.copy()
+    local_env = dotenv_values(BASE_DIR / ".env")
+    env.update({k: v for k, v in local_env.items() if v is not None})
+    return env
+
+
 def get_github_token() -> str | None:
     script = SCRIPTS_DIR / "get_github_app_token.py"
     if not script.exists():
+        return None
+
+    env = load_local_env()
+    if not env.get("GITHUB_APP_ID") or not env.get("GITHUB_APP_INSTALLATION_ID"):
         return None
 
     result = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
+        env=env,
     )
 
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"GitHub App token error: {detail}")
+
     token = result.stdout.strip()
-    return token or None
+    if not token:
+        raise RuntimeError("GitHub App token script returned empty output.")
+    return token
 
 
 def render_template(text: str, ctx: dict) -> str:
@@ -250,6 +268,8 @@ def deploy(c, project):
     # --------------------------------------------------
 
     token = get_github_token()
+    if not token and REPO_URL.startswith("https://"):
+        debug("No GitHub App token configured; cloning without auth (public repos only).")
 
     if c.run(f"test -d {PROJECT_DIR}/.git", warn=True).failed:
         debug("Cloning repository")

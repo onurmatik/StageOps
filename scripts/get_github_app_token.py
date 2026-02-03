@@ -78,7 +78,7 @@ def main() -> None:
     payload = {
         "iat": now - 60,
         "exp": now + (10 * 60),
-        "iss": args.app_id,
+        "iss": str(args.app_id),
     }
 
     key = args.private_key.read_text()
