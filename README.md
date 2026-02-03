@@ -59,7 +59,6 @@ StageOps/
 │       └── django.conf.j2
 │
 ├── scripts/
-│   ├── get_github_app_token.py
 │   └── verify_host.sh
 │
 └── README.md
