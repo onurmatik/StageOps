@@ -33,6 +33,7 @@ ExecStart=/srv/apps/%i/venv/bin/gunicorn %i.wsgi:application \
 # Important difference vs hot tier
 Restart=on-failure
 RestartSec=5
+StopWhenUnneeded=yes
 
 # Cold-tier resource limits
 MemoryMax=300M
