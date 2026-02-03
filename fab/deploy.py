@@ -122,6 +122,9 @@ def load_all_configs(only: list[str] | None = None) -> tuple[dict, list[dict]]:
     config = load_yaml_config()
     server = require_mapping(config.get("server"), "server")
     require_keys("server", server, ["host", "user", "ssh_key", "log_access", "log_errors"])
+    defaults = server.get("defaults") or {}
+    if defaults:
+        defaults = require_mapping(defaults, "server.defaults")
 
     raw_apps = normalize_apps(config.get("apps"))
     if not raw_apps:
@@ -138,6 +141,8 @@ def load_all_configs(only: list[str] | None = None) -> tuple[dict, list[dict]]:
     apps: list[dict] = []
     for name, raw in app_items:
         app = require_mapping(raw, f"apps.{name}")
+        if defaults:
+            apply_defaults(app, defaults)
         apps.append(validate_app(name, app))
 
     return server, apps
@@ -168,6 +173,13 @@ def parse_list(value: object) -> list[str]:
 def parse_backend_paths(raw: object) -> list[str]:
     paths = parse_list(raw)
     return [p.rstrip("/") for p in paths]
+
+
+def apply_defaults(app: dict, defaults: dict) -> dict:
+    for key, value in defaults.items():
+        if key not in app or app[key] is None:
+            app[key] = value
+    return app
 
 
 def parse_cron_entries(value: object) -> list[str]:

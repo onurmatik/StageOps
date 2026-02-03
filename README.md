@@ -107,6 +107,15 @@ server:
   ssh_key: ~/.ssh/stage-ec2-key.pem
   log_access: /var/log/{PROJECT_NAME}/gunicorn-access.log
   log_errors: /var/log/{PROJECT_NAME}/gunicorn-error.log
+  defaults:
+    gunicorn_workers: 1
+    gunicorn_threads: 2
+    gunicorn_timeout: 60
+    gunicorn_graceful_timeout: 30
+    gunicorn_max_requests: 500
+    gunicorn_max_requests_jitter: 50
+    memory_limit: 400M
+    cpu_quota: 40%
 
 apps:
   newsradar:
@@ -118,15 +127,9 @@ apps:
     celery_queue: newsradar
     backend_paths: ["/api"]
     gunicorn_worker_class: gthread
-    gunicorn_workers: 1
-    gunicorn_threads: 2
-    gunicorn_timeout: 60
-    gunicorn_graceful_timeout: 30
-    gunicorn_max_requests: 500
-    gunicorn_max_requests_jitter: 50
-    memory_limit: 400M
-    cpu_quota: 40%
 ```
+
+Values under `server.defaults` are applied to each app unless the app overrides them.
 
 No project-specific logic lives in StageOps code.
 Only data.

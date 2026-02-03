@@ -1,4 +1,4 @@
-# StageOps infra configuration (single file)
+# StageOps infra configuration
 
 server:
   host: 18.206.25.249
@@ -6,6 +6,16 @@ server:
   ssh_key: ~/.ssh/stage-ec2-key.pem
   log_access: /var/log/{PROJECT_NAME}/gunicorn-access.log
   log_errors: /var/log/{PROJECT_NAME}/gunicorn-error.log
+  defaults:
+    gunicorn_worker_class: gthread
+    gunicorn_workers: 1
+    gunicorn_threads: 2
+    gunicorn_timeout: 60
+    gunicorn_graceful_timeout: 30
+    gunicorn_max_requests: 500
+    gunicorn_max_requests_jitter: 50
+    memory_limit: 400M
+    cpu_quota: 40%
 
 apps:
   mevzuat:
@@ -22,25 +32,12 @@ apps:
     celery_queue: mevzuat
 
     cron:
-      - "0 0 * * * fetch_new_docs"
+      - "0 * * * * fetch_new_docs"
 
     backend_paths:
       - /api
       - /mAdmin
       - /rss
-
-    gunicorn_worker_class: gthread
-    gunicorn_workers: 1
-    gunicorn_threads: 2
-    gunicorn_timeout: 60
-    gunicorn_graceful_timeout: 30
-    gunicorn_max_requests: 500
-    gunicorn_max_requests_jitter: 50
-
-    memory_limit: 400M
-    cpu_quota: 40%
-
-    legacy_projects: []
 
   newsradar:
     project_name: newsradar
@@ -55,20 +52,10 @@ apps:
     enable_celery: true
     celery_queue: newsradar
 
+    cron:
+      - "30 * * * * scheduled_web_search_execution"
+
     backend_paths:
       - /api
       - /nrAdmin
       - /rss
-
-    gunicorn_worker_class: gthread
-    gunicorn_workers: 1
-    gunicorn_threads: 2
-    gunicorn_timeout: 60
-    gunicorn_graceful_timeout: 30
-    gunicorn_max_requests: 500
-    gunicorn_max_requests_jitter: 50
-
-    memory_limit: 400M
-    cpu_quota: 40%
-
-    legacy_projects: []
